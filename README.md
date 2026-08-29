@@ -44,7 +44,7 @@ Move the mouse over any image in a tweet. A round button (💾) appears in the t
 You can change these items at the top of the script:
 
 * `BUTTON_TEXT`, `BUTTON_SIZE`, `BUTTON_FONT_SIZE` – change the button appearance.
-* `DEBUG` – set to `false` to stop console logs. (The provided script has `DEBUG = true` for troubleshooting.)
+* `DEBUG` – is set to `false`. Change to `DEBUG = true` for troubleshooting.
 * The filename template is in the `downloadImage()` function. You can reorder or add fields.
 
 ## How It Works
