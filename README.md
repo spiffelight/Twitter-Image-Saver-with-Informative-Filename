@@ -2,6 +2,8 @@
 
 This script adds a small download button to each image on Twitter (X). When you click the button, it downloads the image with a filename that contains the author's username, tweet ID, date, and image position.
 
+![The 💾 button appearing on hover over a tweet image](TwitterSaveExample.png)
+
 ## Features
 
 * Adds a small 💾 button on hover over any tweet image.
