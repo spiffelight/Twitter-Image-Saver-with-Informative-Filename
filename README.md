@@ -13,6 +13,7 @@ This script adds a small download button to each image on Twitter (X). When you 
   * Date and time (from the tweet's timestamp)
   * Image position (for tweets with multiple images)
 * Downloads the original image at full resolution.
+* Downloads videos and GIFs as `.mp4` (highest available quality). The video button sits in the tweet's action bar, so nothing is drawn over the video.
 * Works with tweets that load as you scroll.
 * No external dependencies.
 
@@ -41,6 +42,8 @@ The image is saved with this filename. The script does not create a separate met
 
 Move the mouse over any image in a tweet. A round button (💾) appears in the top right corner of the image. Click this button to download the image with the auto-generated filename.
 
+For tweets with a video or GIF, a small 💾 button is added at the end of the action bar (next to reply, retweet, like and share). Click it to download the video as an `.mp4`.
+
 ## Customization
 
 You can change these items at the top of the script:
@@ -55,6 +58,7 @@ You can change these items at the top of the script:
 2. The script adds a small button to the image container. The button is hidden until you hover over the image.
 3. When you click the button, the script reads the tweet information from the page. It uses multiple fallback selectors for reliability.
 4. The script fetches the image with `GM_xmlhttpRequest` (to avoid CORS issues) and saves it with the generated filename.
+5. For videos, the page only holds a streaming source, so the script asks Twitter's public embed endpoint (`cdn.syndication.twimg.com`) for the tweet's `.mp4` files, picks the highest bitrate, and saves it the same way.
 
 ## Troubleshooting
 
@@ -65,6 +69,7 @@ You can change these items at the top of the script:
 
 * Twitter may change its page structure. The script uses multiple fallback methods, but updates may be necessary.
 * The script processes only images from `twimg.com/media`. It does not process avatars or other images.
+* Video download relies on an unofficial embed endpoint that Twitter could change or restrict. Protected, age-restricted or deleted tweets may not return a video.
 
 ## License
 
@@ -78,13 +83,15 @@ Copy and paste the following code into a new Tampermonkey/Greasemonkey script.
 // ==UserScript==
 // @name         Twitter Image Saver with Info (Robust)
 // @namespace    http://tampermonkey.net/
-// @version      1.2
-// @description  Download Twitter images with auto-generated filenames. Enhanced tweet info extraction.
+// @version      1.3
+// @description  Download Twitter images and videos with auto-generated filenames. Enhanced tweet info extraction.
 // @author       You
 // @match        https://twitter.com/*
 // @match        https://x.com/*
 // @grant        GM_xmlhttpRequest
 // @connect      twimg.com
+// @connect      video.twimg.com
+// @connect      cdn.syndication.twimg.com
 // @run-at       document-idle
 // ==/UserScript==
 
@@ -96,6 +103,7 @@ Copy and paste the following code into a new Tampermonkey/Greasemonkey script.
     const BUTTON_TITLE = 'Download image';
     const BUTTON_SIZE = '28px';
     const BUTTON_FONT_SIZE = '16px';
+    const VIDEO_BUTTON_TITLE = 'Download video';
     const DEBUG = true;  // Set to false to disable console logs
 
     function log(...args) {
@@ -112,22 +120,31 @@ Copy and paste the following code into a new Tampermonkey/Greasemonkey script.
         return `${date.getFullYear()}-${pad(date.getMonth()+1)}-${pad(date.getDate())}_${pad(date.getHours())}-${pad(date.getMinutes())}-${pad(date.getSeconds())}`;
     }
 
+    function buildFilename(info, ext) {
+        const username = sanitizeFilename(info.username || 'unknown');
+        const tweetId = info.tweetId || 'no_id';
+        const dateStr = info.date ? formatDate(info.date) : 'no_date';
+        const indexStr = info.index ? `_${info.index}` : '';
+        return `${username}_${tweetId}_${dateStr}${indexStr}.${ext}`;
+    }
+
     // ---------- Extract Tweet Info (with fallbacks) ----------
-    function getTweetInfo(img) {
-        log('getTweetInfo called for image:', img.src.slice(0, 100));
+    // `el` is the media element (an <img>) or the tweet article itself (videos).
+    function getTweetInfo(el) {
+        log('getTweetInfo called for:', el.tagName);
 
         // 1. Standard tweet article
-        let tweet = img.closest('article[data-testid="tweet"]');
+        let tweet = el.closest('article[data-testid="tweet"]');
         if (!tweet) {
             log('No article[data-testid="tweet"] found, trying div fallback.');
             // Sometimes it's a div with the same data-testid
-            tweet = img.closest('div[data-testid="tweet"]');
+            tweet = el.closest('div[data-testid="tweet"]');
         }
 
         // 2. If still not found, try to find any ancestor that contains a status link and a time element
         if (!tweet) {
             log('No div fallback, searching for ancestor with /status/ link.');
-            let ancestor = img.parentElement;
+            let ancestor = el.parentElement;
             while (ancestor && ancestor !== document.body) {
                 if (ancestor.querySelector('a[href*="/status/"]') && ancestor.querySelector('time')) {
                     tweet = ancestor;
@@ -181,9 +198,12 @@ Copy and paste the following code into a new Tampermonkey/Greasemonkey script.
         }
 
         // Image index: count media images within the same tweet container
-        const allMediaImgs = tweet.querySelectorAll('img[src*="twimg.com/media"]');
-        const imgsArray = Array.from(allMediaImgs);
-        info.index = imgsArray.indexOf(img) + 1;
+        if (el.tagName === 'IMG') {
+            const allMediaImgs = tweet.querySelectorAll('img[src*="twimg.com/media"]');
+            info.index = Array.from(allMediaImgs).indexOf(el) + 1;
+        } else {
+            info.index = 1;
+        }
 
         // If tweetId is still missing, try to get from page URL (if we are on a status page)
         if (!info.tweetId) {
@@ -195,26 +215,20 @@ Copy and paste the following code into a new Tampermonkey/Greasemonkey script.
         return info;
     }
 
-    // ---------- Download Image via GM_xmlhttpRequest ----------
-    function downloadImage(img, info) {
-        const src = img.currentSrc || img.src;
-        if (!src || !src.includes('twimg.com/media')) {
-            log('Invalid image source:', src);
-            return;
+    // ---------- Save a URL to disk via GM_xmlhttpRequest ----------
+    function saveUrl(src, filename) {
+        log('Saving:', src, '->', filename);
+
+        function triggerSave(blob) {
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            document.body.removeChild(a);
+            setTimeout(() => URL.revokeObjectURL(url), 10000);
         }
-
-        log('Downloading image:', src);
-        log('Tweet info:', info);
-
-        const username = sanitizeFilename(info.username || 'unknown');
-        const tweetId = info.tweetId || 'no_id';
-        const dateStr = info.date ? formatDate(info.date) : 'no_date';
-        const indexStr = info.index ? `_${info.index}` : '';
-        const fileExt = src.split('.').pop().split('?')[0].toLowerCase();
-        const ext = ['jpg','jpeg','png','gif','webp'].includes(fileExt) ? fileExt : 'jpg';
-        const filename = `${username}_${tweetId}_${dateStr}${indexStr}.${ext}`;
-
-        log('Filename:', filename);
 
         if (typeof GM_xmlhttpRequest === 'function') {
             GM_xmlhttpRequest({
@@ -223,15 +237,7 @@ Copy and paste the following code into a new Tampermonkey/Greasemonkey script.
                 responseType: 'blob',
                 onload: function(res) {
                     if (res.status >= 200 && res.status < 300) {
-                        const blob = res.response;
-                        const url = URL.createObjectURL(blob);
-                        const a = document.createElement('a');
-                        a.href = url;
-                        a.download = filename;
-                        document.body.appendChild(a);
-                        a.click();
-                        document.body.removeChild(a);
-                        setTimeout(() => URL.revokeObjectURL(url), 10000);
+                        triggerSave(res.response);
                         log('Download triggered successfully.');
                     } else {
                         console.error('GM_xmlhttpRequest failed with status', res.status);
@@ -247,14 +253,7 @@ Copy and paste the following code into a new Tampermonkey/Greasemonkey script.
             fetch(src, { mode: 'cors' })
                 .then(res => res.blob())
                 .then(blob => {
-                    const url = URL.createObjectURL(blob);
-                    const a = document.createElement('a');
-                    a.href = url;
-                    a.download = filename;
-                    document.body.appendChild(a);
-                    a.click();
-                    document.body.removeChild(a);
-                    setTimeout(() => URL.revokeObjectURL(url), 10000);
+                    triggerSave(blob);
                     log('Download triggered via fetch fallback.');
                 })
                 .catch(err => {
@@ -262,6 +261,70 @@ Copy and paste the following code into a new Tampermonkey/Greasemonkey script.
                     alert('Download failed (fetch). See console for details.');
                 });
         }
+    }
+
+    // ---------- Download Image ----------
+    function downloadImage(img, info) {
+        const src = img.currentSrc || img.src;
+        if (!src || !src.includes('twimg.com/media')) {
+            log('Invalid image source:', src);
+            return;
+        }
+
+        const fileExt = src.split('.').pop().split('?')[0].toLowerCase();
+        const ext = ['jpg','jpeg','png','gif','webp'].includes(fileExt) ? fileExt : 'jpg';
+        saveUrl(src, buildFilename(info, ext));
+    }
+
+    // ---------- Download Video ----------
+    // The <video> element only holds a streaming (blob/HLS) source, so we look
+    // up the tweet's real .mp4 files through Twitter's public embed endpoint.
+    function syndicationToken(tweetId) {
+        return ((Number(tweetId) / 1e15) * Math.PI).toString(36).replace(/(0+|\.)/g, '');
+    }
+
+    // Pick the highest-bitrate .mp4 from a syndication tweet-result payload.
+    function pickBestMp4(data) {
+        const media = (data && data.mediaDetails) || [];
+        for (const m of media) {
+            const variants = (m.video_info && m.video_info.variants) || [];
+            const mp4s = variants.filter(v => v.content_type === 'video/mp4' && v.url);
+            if (mp4s.length) {
+                mp4s.sort((a, b) => (b.bitrate || 0) - (a.bitrate || 0));
+                return mp4s[0].url;
+            }
+        }
+        return null;
+    }
+
+    function downloadVideo(info) {
+        if (!info.tweetId) {
+            alert('Could not determine the tweet ID for this video.');
+            return;
+        }
+
+        const apiUrl = `https://cdn.syndication.twimg.com/tweet-result?id=${info.tweetId}&token=${syndicationToken(info.tweetId)}&lang=en`;
+        log('Looking up video variants:', apiUrl);
+
+        GM_xmlhttpRequest({
+            method: 'GET',
+            url: apiUrl,
+            onload: function(res) {
+                let data = null;
+                try { data = JSON.parse(res.responseText); } catch (e) { /* not JSON */ }
+                const mp4 = pickBestMp4(data);
+                if (!mp4) {
+                    console.error('[TwImgSaver] No mp4 found. Status:', res.status, data);
+                    alert('Could not find a downloadable video for this tweet. Check console for details.');
+                    return;
+                }
+                saveUrl(mp4, buildFilename(info, 'mp4'));
+            },
+            onerror: function(err) {
+                console.error('Video lookup error:', err);
+                alert('Video lookup failed. See console for details.');
+            }
+        });
     }
 
     // ---------- Add Button to Image ----------
@@ -317,10 +380,64 @@ Copy and paste the following code into a new Tampermonkey/Greasemonkey script.
         log('Button added to image:', img.src.slice(0, 80) + '...');
     }
 
-    // ---------- Process Images ----------
+    // ---------- Add Button for Videos ----------
+    // Videos get their button in the tweet's action bar (reply / retweet / like /
+    // share row) so nothing is ever drawn on top of the video or its controls.
+    function addButtonToVideoTweet(article) {
+        if (article.dataset.twVidSaverProcessed) return;
+
+        const actionBar = article.querySelector('[data-testid="reply"]')?.closest('div[role="group"]');
+        if (!actionBar) return;
+        article.dataset.twVidSaverProcessed = 'true';
+
+        const btn = document.createElement('button');
+        btn.textContent = BUTTON_TEXT;
+        btn.title = VIDEO_BUTTON_TITLE;
+        btn.style.cssText = `
+            background: none;
+            border: none;
+            cursor: pointer;
+            font-size: ${BUTTON_FONT_SIZE};
+            padding: 0 8px;
+            color: inherit;
+            opacity: 0.75;
+        `;
+        btn.addEventListener('mouseenter', () => { btn.style.opacity = '1'; });
+        btn.addEventListener('mouseleave', () => { btn.style.opacity = '0.75'; });
+
+        btn.addEventListener('click', (e) => {
+            e.preventDefault();
+            e.stopPropagation();
+            e.stopImmediatePropagation();
+            const info = getTweetInfo(article);
+            if (info) {
+                downloadVideo(info);
+            } else {
+                alert('Could not extract tweet info. Check console for details.');
+            }
+        }, true);  // capture
+
+        actionBar.appendChild(btn);
+        log('Video button added to tweet action bar.');
+    }
+
+    // ---------- Process Media ----------
     function processImages() {
         const imgs = document.querySelectorAll('img[src*="twimg.com/media"]');
         imgs.forEach(addButtonToImage);
+    }
+
+    function processVideos() {
+        const videos = document.querySelectorAll('article[data-testid="tweet"] video');
+        videos.forEach(v => {
+            const article = v.closest('article[data-testid="tweet"]');
+            if (article) addButtonToVideoTweet(article);
+        });
+    }
+
+    function processMedia() {
+        processImages();
+        processVideos();
     }
 
     // ---------- Mutation Observer ----------
@@ -332,13 +449,13 @@ Copy and paste the following code into a new Tampermonkey/Greasemonkey script.
                 break;
             }
         }
-        if (shouldProcess) processImages();
+        if (shouldProcess) processMedia();
     });
 
     observer.observe(document.body, { childList: true, subtree: true });
 
     // Initial processing
-    processImages();
+    processMedia();
     log('Script initialized.');
 })();
 ```
